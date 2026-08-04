@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Factura → RawBT</title>
+<link rel="manifest" href="manifest.json">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, Roboto, Arial, sans-serif;
+    background: #f2f2f2;
+    margin: 0;
+    padding: 16px;
+    color: #222;
+  }
+  h1 { font-size: 18px; margin: 0 0 12px; }
+  .card {
+    background: #fff;
+    border-radius: 10px;
+    padding: 16px;
+    margin-bottom: 14px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+  }
+  input[type=file] {
+    width: 100%;
+    padding: 10px;
+    border: 2px dashed #aaa;
+    border-radius: 8px;
+    background: #fafafa;
+  }
+  button {
+    width: 100%;
+    padding: 14px;
+    font-size: 16px;
+    font-weight: bold;
+    border: none;
+    border-radius: 8px;
+    background: #2e7d32;
+    color: #fff;
+    margin-top: 10px;
+  }
+  button:disabled { background: #aaa; }
+  button.secondary { background: #555; }
+  pre#preview {
+    white-space: pre-wrap;
+    font-family: 'Courier New', monospace;
+    font-size: 13px;
+    background: #111;
+    color: #0f0;
+    padding: 12px;
+    border-radius: 8px;
+    max-height: 400px;
+    overflow-y: auto;
+  }
+  .status { font-size: 13px; color: #666; margin-top: 8px; }
+  .big-status {
+    font-size: 22px;
+    text-align: center;
+    padding: 40px 16px;
+  }
+</style>
+</head>
+<body>
+
+<div id="appBody">
+  <h1>📄 Factura DGI → 🖨️ RawBT</h1>
+
+  <div class="card">
+    <input type="file" id="fileInput" accept="application/pdf">
+    <div class="status" id="status">Selecciona el PDF de la factura...</div>
+  </div>
+
+  <div class="card" id="previewCard" style="display:none;">
+    <button onclick="imprimirRawBT()">🖨️ Imprimir en RawBT</button>
+    <button class="secondary" onclick="document.getElementById('preview').style.display='block'">Ver texto que se va a imprimir</button>
+    <pre id="preview" style="display:none;"></pre>
+  </div>
+</div>
+
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+
+let reciboTexto = "";
+let reciboCufe = "";
+
+// Registrar el service worker (necesario para Share Target)
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("sw.js");
+}
+
+// --- Flujo normal: seleccionar archivo a mano ---
+document.getElementById('fileInput').addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  await procesarPDF(file);
+});
+
+// --- Flujo automático: llegó desde "Compartir" en otra app ---
+window.addEventListener("DOMContentLoaded", async () => {
+  const params = new URLSearchParams(window.location.search);
+  if (params.get("shared") === "1") {
+    mostrarPantallaAuto("Leyendo factura compartida...");
+    try {
+      const cache = await caches.open("factura-rawbt-share-v1");
+      const response = await cache.match("/shared-pdf");
+      if (!response) throw new Error("No se encontró el PDF compartido.");
+      const blob = await response.blob();
+      const file = new File([blob], "factura.pdf", { type: "application/pdf" });
+      await procesarPDF(file);
+      imprimirRawBT();
+      mostrarPantallaAuto("✅ Impreso. Puedes cerrar esta pantalla.");
+      await cache.delete("/shared-pdf");
+    } catch (err) {
+      mostrarPantallaAuto("❌ Error: " + err.message);
+    }
+  } else if (params.get("shared") === "error") {
+    mostrarPantallaAuto("❌ No se pudo recibir el archivo compartido.");
+  }
+});
+
+function mostrarPantallaAuto(mensaje) {
+  document.getElementById("appBody").innerHTML =
+    `<div class="big-status">${mensaje}</div>`;
+}
+
+async function procesarPDF(file) {
+  document.getElementById('status') && (document.getElementById('status').textContent = "Leyendo PDF...");
+  const buffer = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data: buffer }).promise;
+  let fullText = "";
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const content = await page.getTextContent();
+    fullText += content.items.map(it => it.str).join(" ") + "\n";
+  }
+  const datos = parsearFactura(fullText);
+  reciboTexto = construirRecibo(datos);
+  reciboCufe = datos.cufe;
+
+  const preview = document.getElementById('preview');
+  if (preview) preview.textContent = reciboTexto;
+  const previewCard = document.getElementById('previewCard');
+  if (previewCard) previewCard.style.display = 'block';
+  const status = document.getElementById('status');
+  if (status) status.textContent = "✅ Listo. Revisa y presiona Imprimir.";
+}
+
+function limpiar(txt) {
+  return txt ? txt.trim() : "-";
+}
+
+function buscar(regex, texto, grupo = 1) {
+  const m = texto.match(regex);
+  return m ? limpiar(m[grupo]) : "-";
+}
+
+function parsearFactura(texto) {
+  const t = texto.replace(/\s+/g, " ");
+
+  return {
+    emisorNombre: buscar(/Emisor:\s*(.+?)\s*RUC:/, t),
+    emisorRuc: buscar(/RUC:\s*([\d\-]+)\s*DV:/, t),
+    emisorDV: buscar(/DV:\s*(\d+)\s*Direcci/, t),
+    emisorDir: buscar(/Direcci[oó]n:\s*(.+?)\s*Tipo de Receptor/, t),
+
+    clienteNombre: buscar(/Cliente:\s*(.+?)\s*RUC\/C[eé]dula/, t),
+    clienteRuc: buscar(/RUC\/C[eé]dula\/Pasaporte:\s*([\d\-]+)\s*DV:/, t),
+    clienteDV: buscar(/DV:\s*(\d+)\s*Direcci[oó]n:\s*\w/, t),
+    clienteDir: buscar(/Direcci[oó]n:\s*(\w+)\s*N[uú]mero:/, t),
+
+    numero: buscar(/N[uú]mero:\s*(\d+)/, t),
+    fecha: buscar(/Fecha de Emisi[oó]n:\s*([\d\/]+)/, t),
+    puntoFact: buscar(/Punto de Facturaci[oó]n:\s*(\d+)/, t),
+    cufe: buscar(/CUFE:\s*([A-Z0-9\-]+)/, t),
+    protocolo: buscar(/Protocolo de autorizaci[oó]n:\s*([\d]+,\s*de\s*[\d\/\s:]+)/, t),
+
+    valorTotal: buscar(/Valor Total\s*([\d.]+)/, t),
+    totalNeto: buscar(/Total Neto\s*([\d.]+)/, t),
+    montoExento: buscar(/Monto Exento ITBMS\s*([\d.]+)/, t),
+    montoGravado: buscar(/Monto Gravado ITBMS\s*([\d.]+)/, t),
+    itbms: buscar(/\bITBMS\s*([\d.]+)\s*Total Impuesto/, t),
+    totalImpuesto: buscar(/Total Impuesto\s*([\d.]+)/, t),
+    total: buscar(/Total Impuesto\s*[\d.]+\s*Total\s*([\d.]+)/, t),
+
+    efectivo: buscar(/Efectivo\s*([\d.]+)/, t),
+    totalPagado: buscar(/TOTAL PAGADO\s*([\d.]+)/, t),
+    vuelto: buscar(/Vuelto\s*([\d.]+)/, t)
+  };
+}
+
+function construirRecibo(d) {
+  const linea = "-".repeat(32);
+  return `
+        DGI
+  COMPROBANTE AUXILIAR
+  FACTURA ELECTRONICA
+${linea}
+EMISOR
+${d.emisorNombre}
+RUC: ${d.emisorRuc}  DV: ${d.emisorDV}
+${d.emisorDir}
+${linea}
+CLIENTE
+${d.clienteNombre}
+RUC/Ced: ${d.clienteRuc}  DV: ${d.clienteDV}
+Dir: ${d.clienteDir}
+${linea}
+Numero:      ${d.numero}
+Fecha:       ${d.fecha}
+Punto Fact:  ${d.puntoFact}
+
+CUFE:
+${d.cufe}
+
+Protocolo:
+${d.protocolo}
+${linea}
+TOTALES
+Valor Total:      ${d.valorTotal}
+Total Neto:       ${d.totalNeto}
+Monto Exento:     ${d.montoExento}
+Monto Gravado:    ${d.montoGravado}
+ITBMS:            ${d.itbms}
+Total Impuesto:   ${d.totalImpuesto}
+TOTAL:            ${d.total}
+${linea}
+FORMA DE PAGO
+Efectivo:      ${d.efectivo}
+Total Pagado:  ${d.totalPagado}
+Vuelto:        ${d.vuelto}
+${linea}
+   Generado desde Facturador
+      Gratuito SFEP - DGI
+
+
+`;
+}
+
+function envolverTexto(ctx, texto, maxWidth) {
+  if (texto === "") return [""];
+  const palabras = texto.split(" ");
+  const lineas = [];
+  let actual = "";
+  for (const palabra of palabras) {
+    const prueba = actual ? actual + " " + palabra : palabra;
+    if (ctx.measureText(prueba).width > maxWidth && actual) {
+      lineas.push(actual);
+      actual = palabra;
+    } else {
+      actual = prueba;
+    }
+  }
+  if (actual) lineas.push(actual);
+  return lineas;
+}
+
+function construirImagenQR(qrContenido) {
+  const qrPixelSize = 260;
+  const width = qrPixelSize + 40;
+  const labelHeight = 50;
+  const totalHeight = qrPixelSize + labelHeight + 20;
+
+  const qr = qrcode(0, "M");
+  qr.addData(qrContenido);
+  qr.make();
+  const moduleCount = qr.getModuleCount();
+  const cell = qrPixelSize / moduleCount;
+
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = totalHeight;
+  const ctx = canvas.getContext("2d");
+
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, width, totalHeight);
+  ctx.fillStyle = "#000000";
+
+  const qrX = (width - qrPixelSize) / 2;
+  const qrY = 10;
+  for (let r = 0; r < moduleCount; r++) {
+    for (let c = 0; c < moduleCount; c++) {
+      if (qr.isDark(r, c)) {
+        ctx.fillRect(qrX + c * cell, qrY + r * cell, Math.ceil(cell), Math.ceil(cell));
+      }
+    }
+  }
+
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  ctx.font = "16px 'Courier New', monospace";
+  ctx.fillText("Escanea para verificar", width / 2, qrY + qrPixelSize + 10);
+  ctx.fillText("en la DGI", width / 2, qrY + qrPixelSize + 30);
+
+  return canvas.toDataURL("image/png");
+}
+
+function construirImagenRecibo(texto, qrContenido) {
+  const escala = 2; // renderiza al doble y se imprime a tamaño normal = más nítido
+  const width = 384 * escala;
+  const fontSize = 26 * escala;
+  const lineHeight = 32 * escala;
+  const maxTextWidth = width - (16 * escala);
+
+  const canvasTmp = document.createElement("canvas");
+  const ctxTmp = canvasTmp.getContext("2d");
+  ctxTmp.font = "bold " + fontSize + "px 'Courier New', monospace";
+
+  const lineasOriginales = texto.split("\n");
+  let lineasFinales = [];
+  for (const linea of lineasOriginales) {
+    lineasFinales = lineasFinales.concat(envolverTexto(ctxTmp, linea, maxTextWidth));
+  }
+
+  const qr = qrcode(0, "M");
+  qr.addData(qrContenido);
+  qr.make();
+  const moduleCount = qr.getModuleCount();
+  const qrPixelSize = 260 * escala;
+  const cell = qrPixelSize / moduleCount;
+
+  const topTextHeight = lineasFinales.length * lineHeight + (16 * escala);
+  const qrLabelHeight = 50 * escala;
+  const totalHeight = topTextHeight + qrPixelSize + qrLabelHeight + (24 * escala);
+
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = totalHeight;
+  const ctx = canvas.getContext("2d");
+  ctx.imageSmoothingEnabled = false;
+
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, width, totalHeight);
+  ctx.fillStyle = "#000000";
+  ctx.textBaseline = "top";
+  ctx.font = "bold " + fontSize + "px 'Courier New', monospace";
+
+  let y = 8 * escala;
+  for (const linea of lineasFinales) {
+    ctx.fillText(linea, 8 * escala, y);
+    y += lineHeight;
+  }
+
+  y += 8 * escala;
+  const qrX = (width - qrPixelSize) / 2;
+  for (let r = 0; r < moduleCount; r++) {
+    for (let c = 0; c < moduleCount; c++) {
+      if (qr.isDark(r, c)) {
+        ctx.fillRect(qrX + c * cell, y + r * cell, Math.ceil(cell), Math.ceil(cell));
+      }
+    }
+  }
+
+  y += qrPixelSize + (14 * escala);
+  ctx.textAlign = "center";
+  ctx.font = "bold " + (16 * escala) + "px 'Courier New', monospace";
+  ctx.fillText("Escanea para verificar", width / 2, y);
+  ctx.fillText("en la DGI", width / 2, y + (20 * escala));
+
+  return canvas.toDataURL("image/png");
+}
+
+function imprimirRawBT() {
+  if (!reciboTexto) return;
+  const qrContenido = "https://dgi-fep.mef.gob.pa/Consultas/FacturasPorCUFE/" + reciboCufe;
+  const dataUrl = construirImagenRecibo(reciboTexto, qrContenido);
+  const base64 = dataUrl.split(",")[1];
+  window.location.href = "rawbt:data:image/png;base64," + base64;
+}
+</script>
+
+</body>
+</html>
